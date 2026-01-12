@@ -2,14 +2,18 @@
 """
 Batch Website Auditor
 Processes multiple CPA/accountant websites from a CSV or Excel file
+Supports parallel processing for faster batch audits
 """
 
 import csv
 import os
 import sys
+import argparse
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from website_auditor import WebsiteAuditor
 
 try:
@@ -20,10 +24,53 @@ except ImportError:
 
 
 class BatchAuditor:
-    def __init__(self):
-        self.auditor = WebsiteAuditor()
+    def __init__(self, max_workers: int = 3):
+        self.max_workers = max_workers
         self.results_dir = Path("batch_results")
         self.results_dir.mkdir(exist_ok=True)
+        # Thread-safe progress tracking
+        self._progress_lock = threading.Lock()
+        self._completed_count = 0
+        self._total_count = 0
+
+    def _audit_single_site(self, site_info: Dict, idx: int) -> Dict:
+        """Worker function to audit a single site (thread-safe)"""
+        # Each thread gets its own WebsiteAuditor instance
+        auditor = WebsiteAuditor()
+
+        url = site_info['url']
+        company_name = site_info['company_name'] or url
+
+        try:
+            audit_result = auditor.audit_website(url, company_name=company_name)
+            audit_result['input_notes'] = site_info['notes']
+
+            # Update progress
+            with self._progress_lock:
+                self._completed_count += 1
+                completed = self._completed_count
+                total = self._total_count
+
+            if 'error' not in audit_result:
+                rec = audit_result['recommendation']
+                print(f"\n✅ [{completed}/{total}] {company_name}: {rec['recommendation']} - Score: {rec['score']}/105")
+            else:
+                print(f"\n⚠️  [{completed}/{total}] {company_name}: Error - {audit_result['error'][:50]}")
+
+            return audit_result
+
+        except Exception as e:
+            with self._progress_lock:
+                self._completed_count += 1
+                completed = self._completed_count
+                total = self._total_count
+
+            print(f"\n❌ [{completed}/{total}] {company_name}: Failed - {str(e)[:50]}")
+            return {
+                'url': url,
+                'company_name': company_name,
+                'error': str(e)
+            }
 
     def _read_csv(self, file_path: str) -> List[Dict]:
         """Read URLs from a CSV file"""
@@ -188,8 +235,13 @@ class BatchAuditor:
 
         print(f"📝 Updated original file with audit results: {file_path}")
 
-    def process_file(self, file_path: str) -> List[Dict]:
-        """Process all URLs from a CSV or Excel file"""
+    def process_file(self, file_path: str, parallel: bool = True) -> List[Dict]:
+        """Process all URLs from a CSV or Excel file
+
+        Args:
+            file_path: Path to CSV or Excel file with URLs
+            parallel: If True, process sites in parallel (faster). Default True.
+        """
 
         if not os.path.exists(file_path):
             print(f"❌ Error: File not found: {file_path}")
@@ -211,51 +263,28 @@ class BatchAuditor:
             print("Make sure your file has a 'url' column")
             return []
 
+        # Reset progress tracking
+        self._completed_count = 0
+        self._total_count = len(urls)
+
         print(f"\n{'='*70}")
         print(f"🚀 BATCH AUDIT STARTED")
         print(f"{'='*70}")
         print(f"Total websites to audit: {len(urls)}")
+        print(f"Processing mode: {'Parallel (' + str(self.max_workers) + ' workers)' if parallel else 'Sequential'}")
         print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*70}\n")
+        print(f"{'='*70}")
 
-        # Process each URL
-        results = []
-        for idx, site_info in enumerate(urls, 1):
-            url = site_info['url']
-            company_name = site_info['company_name'] or url
+        start_time = datetime.now()
 
-            print(f"\n{'─'*70}")
-            print(f"[{idx}/{len(urls)}] Processing: {company_name}")
-            print(f"URL: {url}")
-            print(f"{'─'*70}")
+        if parallel and len(urls) > 1:
+            # Parallel processing
+            results = self._process_parallel(urls)
+        else:
+            # Sequential processing (for single URL or if parallel disabled)
+            results = self._process_sequential(urls)
 
-            try:
-                audit_result = self.auditor.audit_website(url, company_name=company_name)
-
-                # Add additional info to results
-                audit_result['input_notes'] = site_info['notes']
-
-                results.append(audit_result)
-
-                # Show quick summary
-                if 'error' not in audit_result:
-                    rec = audit_result['recommendation']
-                    print(f"\n✅ Complete: {rec['recommendation']} - Score: {rec['score']}/100")
-                else:
-                    print(f"\n⚠️  Error: {audit_result['error']}")
-
-            except Exception as e:
-                print(f"\n❌ Failed to audit {url}: {str(e)}")
-                results.append({
-                    'url': url,
-                    'company_name': company_name,
-                    'error': str(e)
-                })
-
-            # Progress update
-            remaining = len(urls) - idx
-            if remaining > 0:
-                print(f"\n📊 Progress: {idx}/{len(urls)} complete, {remaining} remaining")
+        elapsed = (datetime.now() - start_time).total_seconds()
 
         # Update original file with results
         self._update_original_file(file_path, results)
@@ -267,8 +296,48 @@ class BatchAuditor:
         print(f"✅ BATCH AUDIT COMPLETE")
         print(f"{'='*70}")
         print(f"Total audited: {len(results)}")
+        print(f"Time elapsed: {elapsed:.1f}s ({elapsed/len(results):.1f}s per site)")
         print(f"Summary saved to: {summary_path}")
         print(f"{'='*70}\n")
+
+        return results
+
+    def _process_parallel(self, urls: List[Dict]) -> List[Dict]:
+        """Process URLs in parallel using ThreadPoolExecutor"""
+        results = []
+
+        print(f"\n🔄 Starting {self.max_workers} parallel workers...")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_site = {
+                executor.submit(self._audit_single_site, site_info, idx): site_info
+                for idx, site_info in enumerate(urls, 1)
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_site):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    site_info = future_to_site[future]
+                    print(f"\n❌ Unexpected error for {site_info['url']}: {str(e)}")
+                    results.append({
+                        'url': site_info['url'],
+                        'company_name': site_info.get('company_name', ''),
+                        'error': str(e)
+                    })
+
+        return results
+
+    def _process_sequential(self, urls: List[Dict]) -> List[Dict]:
+        """Process URLs sequentially (original behavior)"""
+        results = []
+
+        for idx, site_info in enumerate(urls, 1):
+            result = self._audit_single_site(site_info, idx)
+            results.append(result)
 
         return results
 
@@ -436,15 +505,34 @@ class BatchAuditor:
 def main():
     """CLI entry point for batch processing"""
 
-    if len(sys.argv) < 2:
-        print("Usage: python batch_auditor.py <file>")
-        print("Example: python batch_auditor.py prospects.csv")
-        print("         python batch_auditor.py prospects.xlsx")
-        print("\nSupported formats: .csv, .xlsx, .xls")
-        print("File should have columns: url, company_name (optional), notes (optional)")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description='Batch Website Auditor - Process multiple websites in parallel',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python batch_auditor.py prospects.csv                    # Default: 3 parallel workers
+  python batch_auditor.py prospects.xlsx --workers 5      # Use 5 parallel workers
+  python batch_auditor.py prospects.csv --sequential      # Process one at a time
 
-    file_path = sys.argv[1]
+File format:
+  CSV or Excel file with columns: url (required), company_name (optional), notes (optional)
+        """
+    )
+
+    parser.add_argument('file', help='CSV or Excel file with URLs to audit')
+    parser.add_argument(
+        '-w', '--workers',
+        type=int,
+        default=3,
+        help='Number of parallel workers (default: 3, max recommended: 5)'
+    )
+    parser.add_argument(
+        '-s', '--sequential',
+        action='store_true',
+        help='Process sites one at a time (disables parallel processing)'
+    )
+
+    args = parser.parse_args()
 
     # Check for API key
     if not os.getenv("ANTHROPIC_API_KEY"):
@@ -453,8 +541,15 @@ def main():
         print("  ANTHROPIC_API_KEY=your_key_here")
         sys.exit(1)
 
-    batch_auditor = BatchAuditor()
-    results = batch_auditor.process_file(file_path)
+    # Validate workers
+    if args.workers < 1:
+        print("❌ Error: --workers must be at least 1")
+        sys.exit(1)
+    if args.workers > 10:
+        print("⚠️  Warning: More than 10 workers may cause rate limiting or system issues")
+
+    batch_auditor = BatchAuditor(max_workers=args.workers)
+    results = batch_auditor.process_file(args.file, parallel=not args.sequential)
 
     # Show final summary
     if results:
