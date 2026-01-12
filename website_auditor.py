@@ -7,6 +7,8 @@ Analyzes websites for design, SEO, and conversion opportunities
 import os
 import re
 import json
+import ssl
+import socket
 import base64
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,8 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
 from dotenv import load_dotenv
+import markdown
+from weasyprint import HTML, CSS
 
 # Load environment variables
 load_dotenv()
@@ -26,9 +30,11 @@ class WebsiteAuditor:
     def __init__(self):
         self.anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.screenshots_dir = Path("screenshots")
-        self.reports_dir = Path("reports")
+        self.reports_md_dir = Path("reports/markdown")
+        self.reports_pdf_dir = Path("reports/pdf")
         self.screenshots_dir.mkdir(exist_ok=True)
-        self.reports_dir.mkdir(exist_ok=True)
+        self.reports_md_dir.mkdir(parents=True, exist_ok=True)
+        self.reports_pdf_dir.mkdir(parents=True, exist_ok=True)
 
     def audit_website(self, url: str, company_name: str = None) -> Dict:
         """Main audit function that coordinates all checks"""
@@ -60,11 +66,14 @@ class WebsiteAuditor:
             # Calculate overall score and recommendation
             audit_results["recommendation"] = self._calculate_recommendation(audit_results)
 
-            # Generate report
-            report_path = self._generate_report(audit_results)
+            # Generate report (both MD and PDF)
+            report_path, pdf_path = self._generate_report(audit_results)
             audit_results["report_path"] = str(report_path)
+            audit_results["pdf_path"] = str(pdf_path)
 
-            print(f"\n✅ Audit complete! Report saved to: {report_path}")
+            print(f"\n✅ Audit complete!")
+            print(f"   📝 Markdown: {report_path}")
+            print(f"   📄 PDF: {pdf_path}")
 
         except Exception as e:
             print(f"\n❌ Error during audit: {str(e)}")
@@ -113,6 +122,9 @@ class WebsiteAuditor:
         # Parse HTML
         soup = BeautifulSoup(html_content, 'html.parser')
 
+        # Check SSL certificate
+        ssl_info = self._check_ssl(url)
+
         return {
             "url": url,
             "screenshot_path": str(screenshot_path),
@@ -122,9 +134,77 @@ class WebsiteAuditor:
             "title": title,
             "technical": {
                 "load_time_seconds": round(load_time, 2),
-                "has_viewport_meta": soup.find("meta", {"name": "viewport"}) is not None
+                "has_viewport_meta": soup.find("meta", {"name": "viewport"}) is not None,
+                "ssl": ssl_info
             }
         }
+
+    def _check_ssl(self, url: str) -> Dict:
+        """Check SSL certificate validity and details"""
+        print("🔒 Checking SSL certificate...")
+
+        result = {
+            "has_ssl": False,
+            "is_valid": False,
+            "issuer": None,
+            "expiry_date": None,
+            "days_until_expiry": None,
+            "error": None
+        }
+
+        parsed = urlparse(url)
+        hostname = parsed.netloc.replace('www.', '')
+
+        # Check if site uses HTTPS
+        if not url.startswith('https://'):
+            result["error"] = "Site does not use HTTPS"
+            return result
+
+        result["has_ssl"] = True
+
+        try:
+            # Create SSL context
+            context = ssl.create_default_context()
+
+            with socket.create_connection((hostname, 443), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert = ssock.getpeercert()
+
+                    # Extract certificate info
+                    result["is_valid"] = True
+
+                    # Get issuer
+                    issuer_info = dict(x[0] for x in cert.get('issuer', []))
+                    result["issuer"] = issuer_info.get('organizationName', 'Unknown')
+
+                    # Get expiry date
+                    expiry_str = cert.get('notAfter', '')
+                    if expiry_str:
+                        # Parse the date (format: 'Mon DD HH:MM:SS YYYY GMT')
+                        expiry_date = datetime.strptime(expiry_str, '%b %d %H:%M:%S %Y %Z')
+                        result["expiry_date"] = expiry_date.strftime('%Y-%m-%d')
+
+                        # Calculate days until expiry
+                        days_until = (expiry_date - datetime.now()).days
+                        result["days_until_expiry"] = days_until
+
+                        if days_until < 0:
+                            result["is_valid"] = False
+                            result["error"] = "Certificate has expired"
+                        elif days_until < 30:
+                            result["error"] = f"Certificate expires soon ({days_until} days)"
+
+        except ssl.SSLCertVerificationError as e:
+            result["is_valid"] = False
+            result["error"] = f"Invalid certificate: {str(e)[:100]}"
+        except socket.timeout:
+            result["error"] = "Connection timed out"
+        except socket.gaierror:
+            result["error"] = "Could not resolve hostname"
+        except Exception as e:
+            result["error"] = f"SSL check failed: {str(e)[:100]}"
+
+        return result
 
     def _audit_visual_design(self, page_data: Dict) -> Dict:
         """Use Claude's vision to assess design quality"""
@@ -394,7 +474,7 @@ Format your response as JSON:
 
         # Scoring system
         score = 0
-        max_score = 100
+        max_score = 105  # Visual(30) + Conversion(25) + Trust(20) + SEO(15) + Technical(15)
         issues = []
         opportunities = []
 
@@ -465,7 +545,7 @@ Format your response as JSON:
             issues.append("NAP not clearly in footer")
             opportunities.append("Ensure consistent NAP in footer for local SEO")
 
-        # Technical (10 points)
+        # Technical (15 points)
         tech = sections["technical"]
         if tech["load_time_seconds"] < 3:
             score += 5
@@ -482,6 +562,21 @@ Format your response as JSON:
         else:
             issues.append("Missing viewport meta tag (mobile optimization)")
             opportunities.append("Add mobile-responsive design")
+
+        # SSL Certificate (5 points)
+        ssl_info = tech.get("ssl", {})
+        if ssl_info.get("has_ssl") and ssl_info.get("is_valid"):
+            score += 5
+            if ssl_info.get("days_until_expiry") and ssl_info["days_until_expiry"] < 30:
+                issues.append(f"SSL certificate expires in {ssl_info['days_until_expiry']} days")
+                opportunities.append("Renew SSL certificate before expiration")
+        elif ssl_info.get("has_ssl") and not ssl_info.get("is_valid"):
+            score += 2  # Partial credit for having SSL even if issues
+            issues.append(f"SSL certificate issue: {ssl_info.get('error', 'Invalid certificate')}")
+            opportunities.append("Fix SSL certificate issues for security")
+        else:
+            issues.append("Website does not use HTTPS/SSL")
+            opportunities.append("Install SSL certificate - critical for security and SEO")
 
         # Calculate recommendation
         score = round(score, 1)
@@ -537,7 +632,7 @@ Format your response as JSON:
         else:
             report_filename = f"{domain} Audit Report.md"
 
-        report_path = self.reports_dir / report_filename
+        report_path = self.reports_md_dir / report_filename
 
         rec = audit_results["recommendation"]
         sections = audit_results["audit_sections"]
@@ -626,10 +721,26 @@ This audit evaluated your website across five key areas that impact how potentia
         report += f"\n### Technical Performance\n\n"
         tech = sections["technical"]
         load_rating = "Good" if tech['load_time_seconds'] < 3 else "Needs Improvement" if tech['load_time_seconds'] < 5 else "Slow"
+
+        # SSL status
+        ssl_info = tech.get("ssl", {})
+        if ssl_info.get("has_ssl") and ssl_info.get("is_valid"):
+            ssl_status = "Valid"
+            ssl_value = f"Yes ({ssl_info.get('issuer', 'Unknown')})"
+            if ssl_info.get("days_until_expiry") and ssl_info["days_until_expiry"] < 30:
+                ssl_status = "Expiring Soon"
+        elif ssl_info.get("has_ssl"):
+            ssl_status = "Invalid"
+            ssl_value = "Certificate Issue"
+        else:
+            ssl_status = "Missing"
+            ssl_value = "No HTTPS"
+
         report += f"| Metric | Value | Status |\n"
         report += f"|--------|-------|--------|\n"
         report += f"| Page Load Time | {tech['load_time_seconds']}s | {load_rating} |\n"
         report += f"| Mobile Optimized | {'Yes' if tech['has_viewport_meta'] else 'No'} | {'Good' if tech['has_viewport_meta'] else 'Needs Attention'} |\n"
+        report += f"| SSL Certificate | {ssl_value} | {ssl_status} |\n"
 
         report += f"""
 ---
@@ -688,11 +799,116 @@ This audit was conducted using automated analysis tools that evaluate websites a
 For questions about implementing these recommendations, consult with a qualified web developer or digital marketing professional.
 """
 
-        # Write report
+        # Write markdown report
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)
 
-        return report_path
+        # Generate PDF report
+        pdf_path = self._generate_pdf_report(report, report_path)
+
+        return report_path, pdf_path
+
+    def _generate_pdf_report(self, markdown_content: str, md_path: Path) -> Path:
+        """Generate a PDF version of the audit report"""
+        print("📄 Generating PDF report...")
+
+        # Convert markdown to HTML
+        html_content = markdown.markdown(
+            markdown_content,
+            extensions=['tables', 'fenced_code']
+        )
+
+        # PDF styling
+        css = CSS(string='''
+            @page {
+                size: letter;
+                margin: 1in;
+            }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                font-size: 11pt;
+                line-height: 1.5;
+                color: #333;
+            }
+            h1 {
+                color: #1a365d;
+                font-size: 24pt;
+                border-bottom: 3px solid #3182ce;
+                padding-bottom: 10px;
+                margin-top: 0;
+            }
+            h2 {
+                color: #2c5282;
+                font-size: 16pt;
+                margin-top: 25px;
+                border-bottom: 1px solid #e2e8f0;
+                padding-bottom: 5px;
+            }
+            h3 {
+                color: #2d3748;
+                font-size: 13pt;
+                margin-top: 20px;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+            }
+            th, td {
+                border: 1px solid #e2e8f0;
+                padding: 10px 12px;
+                text-align: left;
+            }
+            th {
+                background-color: #f7fafc;
+                font-weight: 600;
+                color: #2d3748;
+            }
+            tr:nth-child(even) {
+                background-color: #f7fafc;
+            }
+            hr {
+                border: none;
+                border-top: 1px solid #e2e8f0;
+                margin: 25px 0;
+            }
+            strong {
+                color: #1a202c;
+            }
+            ul, ol {
+                padding-left: 25px;
+            }
+            li {
+                margin-bottom: 5px;
+            }
+            p {
+                margin: 10px 0;
+            }
+            em {
+                color: #718096;
+            }
+        ''')
+
+        # Wrap HTML with proper structure
+        full_html = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Website Audit Report</title>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        '''
+
+        # Generate PDF in the PDF directory
+        pdf_filename = md_path.stem + '.pdf'
+        pdf_path = self.reports_pdf_dir / pdf_filename
+        HTML(string=full_html).write_pdf(pdf_path, stylesheets=[css])
+
+        return pdf_path
 
 
 def main():

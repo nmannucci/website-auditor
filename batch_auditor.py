@@ -296,7 +296,10 @@ class BatchAuditor:
                 'has_google_maps',
                 'design_score',
                 'load_time_seconds',
+                'has_valid_ssl',
+                'ssl_expiry',
                 'report_path',
+                'pdf_path',
                 'error'
             ]
 
@@ -316,6 +319,9 @@ class BatchAuditor:
                     rec = result['recommendation']
                     sections = result['audit_sections']
 
+                    # Get SSL info
+                    ssl_info = sections['technical'].get('ssl', {})
+
                     writer.writerow({
                         'company_name': result.get('company_name', ''),
                         'url': result['url'],
@@ -331,7 +337,10 @@ class BatchAuditor:
                         'has_google_maps': sections['trust_signals']['has_google_maps'],
                         'design_score': sections['visual_design']['score'],
                         'load_time_seconds': sections['technical']['load_time_seconds'],
+                        'has_valid_ssl': ssl_info.get('is_valid', False),
+                        'ssl_expiry': ssl_info.get('expiry_date', ''),
                         'report_path': result.get('report_path', ''),
+                        'pdf_path': result.get('pdf_path', ''),
                         'error': ''
                     })
 
@@ -386,7 +395,7 @@ class BatchAuditor:
                         for opp in rec['opportunities'][:3]:
                             f.write(f"  - {opp}\n")
 
-                    f.write(f"- **Full Report:** [{result.get('report_path', 'N/A')}]({result.get('report_path', '')})\n")
+                    f.write(f"- **Reports:** [Markdown]({result.get('report_path', '')}) | [PDF]({result.get('pdf_path', '')})\n")
                     f.write(f"\n---\n\n")
 
             # Maybe prospects
