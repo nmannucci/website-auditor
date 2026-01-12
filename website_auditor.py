@@ -30,7 +30,7 @@ class WebsiteAuditor:
         self.screenshots_dir.mkdir(exist_ok=True)
         self.reports_dir.mkdir(exist_ok=True)
 
-    def audit_website(self, url: str) -> Dict:
+    def audit_website(self, url: str, company_name: str = None) -> Dict:
         """Main audit function that coordinates all checks"""
         print(f"\n🔍 Starting audit for: {url}")
 
@@ -40,6 +40,7 @@ class WebsiteAuditor:
 
         audit_results = {
             "url": url,
+            "company_name": company_name,
             "timestamp": datetime.now().isoformat(),
             "audit_sections": {}
         }
@@ -526,8 +527,16 @@ Format your response as JSON:
         print("📝 Generating report...")
 
         domain = urlparse(audit_results["url"]).netloc.replace('www.', '')
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_filename = f"audit_{domain}_{timestamp}.md"
+        company_name = audit_results.get("company_name")
+
+        # Generate filename: "Company Name (domain) Audit Report.md" or "domain Audit Report.md"
+        if company_name:
+            # Sanitize company name for filename (remove invalid characters)
+            safe_name = re.sub(r'[<>:"/\\|?*]', '', company_name).strip()
+            report_filename = f"{safe_name} ({domain}) Audit Report.md"
+        else:
+            report_filename = f"{domain} Audit Report.md"
+
         report_path = self.reports_dir / report_filename
 
         rec = audit_results["recommendation"]

@@ -230,10 +230,9 @@ class BatchAuditor:
             print(f"{'─'*70}")
 
             try:
-                audit_result = self.auditor.audit_website(url)
+                audit_result = self.auditor.audit_website(url, company_name=company_name)
 
-                # Add company info to results
-                audit_result['company_name'] = company_name
+                # Add additional info to results
                 audit_result['input_notes'] = site_info['notes']
 
                 results.append(audit_result)
