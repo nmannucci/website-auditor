@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+screenshots/
+reports/
+batch_results/
+venv/
+*.log
