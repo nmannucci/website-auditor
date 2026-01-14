@@ -6,13 +6,17 @@ Supports parallel processing for faster batch audits
 """
 
 import csv
+import io
 import os
+import re
 import sys
 import argparse
 import threading
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from website_auditor import WebsiteAuditor
 
@@ -21,6 +25,13 @@ try:
     EXCEL_SUPPORT = True
 except ImportError:
     EXCEL_SUPPORT = False
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_SUPPORT = True
+except ImportError:
+    GSPREAD_SUPPORT = False
 
 
 class BatchAuditor:
@@ -123,6 +134,185 @@ class BatchAuditor:
 
         wb.close()
         return urls
+
+    def _is_google_sheet_url(self, path: str) -> bool:
+        """Check if the given path is a Google Sheets URL"""
+        return bool(re.match(r'https?://docs\.google\.com/spreadsheets/d/', path))
+
+    def _extract_sheet_id(self, url: str) -> Optional[str]:
+        """Extract the sheet ID from a Google Sheets URL"""
+        # Match patterns like:
+        # https://docs.google.com/spreadsheets/d/SHEET_ID/...
+        # https://docs.google.com/spreadsheets/d/SHEET_ID
+        match = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
+        return match.group(1) if match else None
+
+    def _extract_gid(self, url: str) -> Optional[str]:
+        """Extract the gid (sheet tab ID) from a Google Sheets URL"""
+        # Match gid=NUMBER in the URL
+        match = re.search(r'[#&?]gid=(\d+)', url)
+        return match.group(1) if match else None
+
+    def _read_google_sheet(self, url: str) -> List[Dict]:
+        """Read URLs from a Google Sheets URL
+
+        Tries two methods:
+        1. Public CSV export (works for published/public sheets)
+        2. gspread with service account (works for private sheets)
+        """
+        sheet_id = self._extract_sheet_id(url)
+        if not sheet_id:
+            print(f"❌ Error: Could not extract sheet ID from URL: {url}")
+            return []
+
+        gid = self._extract_gid(url)
+
+        # Method 1: Try public CSV export
+        print(f"📊 Attempting to access Google Sheet...")
+        urls = self._read_google_sheet_public(sheet_id, gid)
+
+        if urls is not None:
+            return urls
+
+        # Method 2: Try gspread with service account
+        if GSPREAD_SUPPORT:
+            print("🔐 Public access failed, trying authenticated access...")
+            urls = self._read_google_sheet_gspread(sheet_id, gid)
+            if urls is not None:
+                return urls
+
+        print("❌ Error: Could not access Google Sheet.")
+        print("   For public sheets: Make sure the sheet is shared as 'Anyone with link can view'")
+        if GSPREAD_SUPPORT:
+            print("   For private sheets: Set GOOGLE_SERVICE_ACCOUNT_FILE env var to your credentials JSON path")
+        else:
+            print("   For private sheets: Install gspread with 'pip install gspread google-auth'")
+
+        return []
+
+    def _read_google_sheet_public(self, sheet_id: str, gid: Optional[str] = None) -> Optional[List[Dict]]:
+        """Try to read a Google Sheet via public CSV export"""
+        # Build the CSV export URL
+        export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+        if gid:
+            export_url += f"&gid={gid}"
+
+        try:
+            # Create request with a browser-like user agent
+            req = urllib.request.Request(
+                export_url,
+                headers={'User-Agent': 'Mozilla/5.0 (compatible; WebsiteAuditor/1.0)'}
+            )
+
+            with urllib.request.urlopen(req, timeout=30) as response:
+                content = response.read().decode('utf-8')
+
+            # Parse CSV content
+            urls = []
+            reader = csv.DictReader(io.StringIO(content))
+            for row in reader:
+                # Handle case-insensitive column names
+                row_lower = {k.lower().strip(): v for k, v in row.items() if k}
+
+                if 'url' in row_lower and row_lower['url'].strip():
+                    urls.append({
+                        'url': row_lower['url'].strip(),
+                        'company_name': row_lower.get('company_name', '').strip(),
+                        'notes': row_lower.get('notes', '').strip()
+                    })
+
+            if urls:
+                print(f"✅ Successfully loaded {len(urls)} URLs from Google Sheet (public access)")
+                return urls
+            else:
+                print("⚠️  Sheet accessed but no URLs found. Make sure the sheet has a 'url' column.")
+                return []
+
+        except urllib.error.HTTPError as e:
+            if e.code == 401 or e.code == 403:
+                # Sheet is not public
+                return None
+            print(f"❌ HTTP Error accessing sheet: {e.code} {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            print(f"❌ Network error accessing sheet: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"❌ Error reading sheet: {e}")
+            return None
+
+    def _read_google_sheet_gspread(self, sheet_id: str, gid: Optional[str] = None) -> Optional[List[Dict]]:
+        """Read a Google Sheet using gspread with service account credentials"""
+        if not GSPREAD_SUPPORT:
+            return None
+
+        # Look for service account credentials
+        creds_path = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE')
+        if not creds_path:
+            # Try common locations
+            common_paths = [
+                'service_account.json',
+                'credentials.json',
+                os.path.expanduser('~/.config/gspread/service_account.json')
+            ]
+            for path in common_paths:
+                if os.path.exists(path):
+                    creds_path = path
+                    break
+
+        if not creds_path or not os.path.exists(creds_path):
+            print("⚠️  No service account credentials found.")
+            return None
+
+        try:
+            scopes = [
+                'https://www.googleapis.com/auth/spreadsheets.readonly',
+                'https://www.googleapis.com/auth/drive.readonly'
+            ]
+            credentials = Credentials.from_service_account_file(creds_path, scopes=scopes)
+            gc = gspread.authorize(credentials)
+
+            # Open the spreadsheet
+            spreadsheet = gc.open_by_key(sheet_id)
+
+            # Get the right worksheet
+            if gid:
+                worksheet = None
+                for ws in spreadsheet.worksheets():
+                    if str(ws.id) == gid:
+                        worksheet = ws
+                        break
+                if not worksheet:
+                    print(f"⚠️  Could not find worksheet with gid={gid}, using first sheet")
+                    worksheet = spreadsheet.sheet1
+            else:
+                worksheet = spreadsheet.sheet1
+
+            # Get all records as dictionaries
+            records = worksheet.get_all_records()
+
+            urls = []
+            for row in records:
+                # Handle case-insensitive column names
+                row_lower = {k.lower().strip(): v for k, v in row.items() if k}
+
+                if 'url' in row_lower and str(row_lower['url']).strip():
+                    urls.append({
+                        'url': str(row_lower['url']).strip(),
+                        'company_name': str(row_lower.get('company_name', '')).strip(),
+                        'notes': str(row_lower.get('notes', '')).strip()
+                    })
+
+            if urls:
+                print(f"✅ Successfully loaded {len(urls)} URLs from Google Sheet (authenticated)")
+                return urls
+            else:
+                print("⚠️  Sheet accessed but no URLs found. Make sure the sheet has a 'url' column.")
+                return []
+
+        except Exception as e:
+            print(f"❌ Error with gspread: {e}")
+            return None
 
     def _update_original_csv(self, file_path: str, results: List[Dict]) -> None:
         """Update original CSV file with score and recommendation columns"""
@@ -236,27 +426,30 @@ class BatchAuditor:
         print(f"📝 Updated original file with audit results: {file_path}")
 
     def process_file(self, file_path: str, parallel: bool = True) -> List[Dict]:
-        """Process all URLs from a CSV or Excel file
+        """Process all URLs from a CSV, Excel file, or Google Sheets URL
 
         Args:
-            file_path: Path to CSV or Excel file with URLs
+            file_path: Path to CSV/Excel file, or a Google Sheets URL
             parallel: If True, process sites in parallel (faster). Default True.
         """
+        is_google_sheet = self._is_google_sheet_url(file_path)
 
-        if not os.path.exists(file_path):
+        if is_google_sheet:
+            urls = self._read_google_sheet(file_path)
+        elif not os.path.exists(file_path):
             print(f"❌ Error: File not found: {file_path}")
             return []
-
-        # Determine file type and read URLs
-        file_ext = Path(file_path).suffix.lower()
-        if file_ext in ['.xlsx', '.xls']:
-            urls = self._read_excel(file_path)
-        elif file_ext == '.csv':
-            urls = self._read_csv(file_path)
         else:
-            print(f"❌ Error: Unsupported file type: {file_ext}")
-            print("Supported formats: .csv, .xlsx, .xls")
-            return []
+            # Determine file type and read URLs
+            file_ext = Path(file_path).suffix.lower()
+            if file_ext in ['.xlsx', '.xls']:
+                urls = self._read_excel(file_path)
+            elif file_ext == '.csv':
+                urls = self._read_csv(file_path)
+            else:
+                print(f"❌ Error: Unsupported file type: {file_ext}")
+                print("Supported formats: .csv, .xlsx, .xls, or Google Sheets URL")
+                return []
 
         if not urls:
             print("❌ No URLs found in file")
@@ -286,8 +479,9 @@ class BatchAuditor:
 
         elapsed = (datetime.now() - start_time).total_seconds()
 
-        # Update original file with results
-        self._update_original_file(file_path, results)
+        # Update original file with results (skip for Google Sheets)
+        if not is_google_sheet:
+            self._update_original_file(file_path, results)
 
         # Generate summary report
         summary_path = self._generate_summary_report(results, file_path)
@@ -513,13 +707,24 @@ Examples:
   python batch_auditor.py prospects.csv                    # Default: 3 parallel workers
   python batch_auditor.py prospects.xlsx --workers 5      # Use 5 parallel workers
   python batch_auditor.py prospects.csv --sequential      # Process one at a time
+  python batch_auditor.py "https://docs.google.com/spreadsheets/d/SHEET_ID/edit"  # Google Sheet
 
-File format:
-  CSV or Excel file with columns: url (required), company_name (optional), notes (optional)
+Supported sources:
+  - CSV files (.csv)
+  - Excel files (.xlsx, .xls)
+  - Google Sheets URL (public or with service account)
+
+Column format:
+  url (required), company_name (optional), notes (optional)
+
+Google Sheets setup:
+  For public sheets: Share the sheet as "Anyone with link can view"
+  For private sheets: Set GOOGLE_SERVICE_ACCOUNT_FILE env var or place
+                      service_account.json in the current directory
         """
     )
 
-    parser.add_argument('file', help='CSV or Excel file with URLs to audit')
+    parser.add_argument('file', help='CSV file, Excel file, or Google Sheets URL')
     parser.add_argument(
         '-w', '--workers',
         type=int,
