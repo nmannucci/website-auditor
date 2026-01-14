@@ -83,18 +83,50 @@ class BatchAuditor:
                 'error': str(e)
             }
 
+    def _normalize_columns(self, row: Dict) -> Dict:
+        """Normalize column names to standard format (url, company_name, notes)"""
+        # Create lowercase mapping
+        row_lower = {k.lower().strip(): v for k, v in row.items() if k}
+
+        # Find URL column (try common alternatives)
+        url_keys = ['url', 'website', 'site', 'domain', 'link', 'web']
+        url_value = ''
+        for key in url_keys:
+            if key in row_lower and row_lower[key]:
+                url_value = str(row_lower[key]).strip()
+                break
+
+        # Find company name column
+        company_keys = ['company_name', 'company name', 'company', 'name', 'business', 'business name']
+        company_value = ''
+        for key in company_keys:
+            if key in row_lower and row_lower[key]:
+                company_value = str(row_lower[key]).strip()
+                break
+
+        # Find notes column
+        notes_keys = ['notes', 'note', 'comments', 'comment']
+        notes_value = ''
+        for key in notes_keys:
+            if key in row_lower and row_lower[key]:
+                notes_value = str(row_lower[key]).strip()
+                break
+
+        return {
+            'url': url_value,
+            'company_name': company_value,
+            'notes': notes_value
+        }
+
     def _read_csv(self, file_path: str) -> List[Dict]:
         """Read URLs from a CSV file"""
         urls = []
         with open(file_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if 'url' in row and row['url'].strip():
-                    urls.append({
-                        'url': row['url'].strip(),
-                        'company_name': row.get('company_name', '').strip(),
-                        'notes': row.get('notes', '').strip()
-                    })
+                normalized = self._normalize_columns(row)
+                if normalized['url']:
+                    urls.append(normalized)
         return urls
 
     def _read_excel(self, file_path: str) -> List[Dict]:
@@ -107,30 +139,16 @@ class BatchAuditor:
         wb = openpyxl.load_workbook(file_path, read_only=True)
         ws = wb.active
 
-        # Get header row to find column indices
-        headers = {}
-        for col_idx, cell in enumerate(next(ws.iter_rows(min_row=1, max_row=1, values_only=True))):
-            if cell:
-                headers[str(cell).lower().strip()] = col_idx
+        # Get header row
+        header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+        headers = [str(cell).strip() if cell else '' for cell in header_row]
 
-        if 'url' not in headers:
-            print("❌ Error: Excel file must have a 'url' column")
-            wb.close()
-            return []
-
-        url_idx = headers['url']
-        company_idx = headers.get('company_name')
-        notes_idx = headers.get('notes')
-
-        # Read data rows
+        # Read data rows and convert to dicts
         for row in ws.iter_rows(min_row=2, values_only=True):
-            url_value = row[url_idx] if url_idx < len(row) else None
-            if url_value and str(url_value).strip():
-                urls.append({
-                    'url': str(url_value).strip(),
-                    'company_name': str(row[company_idx]).strip() if company_idx is not None and company_idx < len(row) and row[company_idx] else '',
-                    'notes': str(row[notes_idx]).strip() if notes_idx is not None and notes_idx < len(row) and row[notes_idx] else ''
-                })
+            row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row))) if headers[i]}
+            normalized = self._normalize_columns(row_dict)
+            if normalized['url']:
+                urls.append(normalized)
 
         wb.close()
         return urls
@@ -211,15 +229,9 @@ class BatchAuditor:
             urls = []
             reader = csv.DictReader(io.StringIO(content))
             for row in reader:
-                # Handle case-insensitive column names
-                row_lower = {k.lower().strip(): v for k, v in row.items() if k}
-
-                if 'url' in row_lower and row_lower['url'].strip():
-                    urls.append({
-                        'url': row_lower['url'].strip(),
-                        'company_name': row_lower.get('company_name', '').strip(),
-                        'notes': row_lower.get('notes', '').strip()
-                    })
+                normalized = self._normalize_columns(row)
+                if normalized['url']:
+                    urls.append(normalized)
 
             if urls:
                 print(f"✅ Successfully loaded {len(urls)} URLs from Google Sheet (public access)")
@@ -293,15 +305,9 @@ class BatchAuditor:
 
             urls = []
             for row in records:
-                # Handle case-insensitive column names
-                row_lower = {k.lower().strip(): v for k, v in row.items() if k}
-
-                if 'url' in row_lower and str(row_lower['url']).strip():
-                    urls.append({
-                        'url': str(row_lower['url']).strip(),
-                        'company_name': str(row_lower.get('company_name', '')).strip(),
-                        'notes': str(row_lower.get('notes', '')).strip()
-                    })
+                normalized = self._normalize_columns(row)
+                if normalized['url']:
+                    urls.append(normalized)
 
             if urls:
                 print(f"✅ Successfully loaded {len(urls)} URLs from Google Sheet (authenticated)")
@@ -370,15 +376,22 @@ class BatchAuditor:
         wb = openpyxl.load_workbook(file_path)
         ws = wb.active
 
-        # Get headers and find url column
+        # Get headers and find url column (try common alternatives)
         headers = {}
         for col_idx, cell in enumerate(ws[1], start=1):
             if cell.value:
                 headers[str(cell.value).lower().strip()] = col_idx
 
-        url_col = headers.get('url')
+        # Find URL column using common alternatives
+        url_col = None
+        url_keys = ['url', 'website', 'site', 'domain', 'link', 'web']
+        for key in url_keys:
+            if key in headers:
+                url_col = headers[key]
+                break
+
         if not url_col:
-            print("❌ Error: Could not find 'url' column in Excel file")
+            print("❌ Error: Could not find URL column in Excel file")
             wb.close()
             return
 
