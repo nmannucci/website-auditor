@@ -9,3 +9,5 @@ reports/
 batch_results/
 venv/
 *.log
+.DS_Store
+csv-batches/
